@@ -1092,15 +1092,8 @@ class ModelResourceTest(TestCase):
 
     @ignore_widget_deprecation_warning
     def test_import_data_skip_unchanged(self):
-        class MyBookResource(resources.ModelResource):
-            save_count = 0
-
-            def save_instance(self, instance, is_create, row, **kwargs):
-                self.save_count += 1
-
-            class Meta:
-                skip_unchanged = True
-                model = Book
+        def attempted_save(instance, new, using_transactions, real_dry_run):
+            self.fail("Resource attempted to save instead of skipping")
 
         # Make sure we test with ManyToMany related objects
         cat1 = Category.objects.create(name="Cat 1")
@@ -1111,15 +1104,16 @@ class ModelResourceTest(TestCase):
 
         # Create a new resource that attempts to reimport the data currently
         # in the database while skipping unchanged rows (i.e. all of them)
-        resource = MyBookResource()
+        resource = deepcopy(self.resource)
+        resource._meta.skip_unchanged = True
+        # Fail the test if the resource attempts to save the row
+        resource.save_instance = attempted_save
         result = resource.import_data(dataset, raise_errors=True)
         self.assertFalse(result.has_errors())
         self.assertEqual(len(result.rows), len(dataset))
         self.assertTrue(result.rows[0].diff)
         self.assertEqual(result.rows[0].import_type, results.RowResult.IMPORT_TYPE_SKIP)
         self.assertEqual(result.rows[0].object_id, self.book.pk)
-        if resource.save_count > 0:
-            self.fail("Resource attempted to save instead of skipping")
 
         # Test that we can suppress reporting of skipped rows
         resource._meta.report_skipped = False
