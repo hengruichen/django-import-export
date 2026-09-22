@@ -109,865 +109,1189 @@ class ImportMixin(BaseImportMixin, ImportExportMixinBase):
 
         if isinstance(tmp_storage_class, str):
             tmp_storage_class = import_string(tmp_storage_class)
+
         return tmp_storage_class
 
-    def has_import_permission(self, request):
+    def get_tmp_storage(self, request):
         """
-        Returns whether a request has import permission.
+        Returns a new instance of the configured temporary file storage.
         """
-        IMPORT_PERMISSION_CODE = getattr(
-            settings, "IMPORT_EXPORT_IMPORT_PERMISSION_CODE", None
-        )
-        if IMPORT_PERMISSION_CODE is None:
-            return True
-
-        opts = self.opts
-        codename = get_permission_codename(IMPORT_PERMISSION_CODE, opts)
-        return request.user.has_perm("%s.%s" % (opts.app_label, codename))
-
-    def get_urls(self):
-        urls = super().get_urls()
-        info = self.get_model_info()
-        my_urls = [
-            path(
-                "process_import/",
-                self.admin_site.admin_view(self.process_import),
-                name="%s_%s_process_import" % info,
-            ),
-            path(
-                "import/",
-                self.admin_site.admin_view(self.import_action),
-                name="%s_%s_import" % info,
-            ),
-        ]
-        return my_urls + urls
+        return self.get_tmp_storage_class()(request)
 
     @method_decorator(require_POST)
-    def process_import(self, request, *args, **kwargs):
+    def import_action(self, request, form, file_format, queryset):
         """
-        Perform the actual import action (after the user has confirmed the import)
+        Handles the import process.
         """
         if not self.has_import_permission(request):
             raise PermissionDenied
 
-        if getattr(self.get_confirm_import_form, "is_original", False):
-            confirm_form = self.create_confirm_form(request)
-        else:
-            form_type = self.get_confirm_import_form()
-            confirm_form = form_type(request.POST)
-
-        if confirm_form.is_valid():
-            import_formats = self.get_import_formats()
-            input_format = import_formats[
-                int(confirm_form.cleaned_data["input_format"])
-            ](encoding=self.from_encoding)
-            encoding = None if input_format.is_binary() else self.from_encoding
-            tmp_storage_cls = self.get_tmp_storage_class()
-            tmp_storage = tmp_storage_cls(
-                name=confirm_form.cleaned_data["import_file_name"],
-                encoding=encoding,
-                read_mode=input_format.get_read_mode(),
-            )
-
-            data = tmp_storage.read()
-            dataset = input_format.create_dataset(data)
-            result = self.process_dataset(
-                dataset, confirm_form, request, *args, **kwargs
-            )
-
-            tmp_storage.remove()
-
-            return self.process_result(result, request)
-
-    def process_dataset(
-        self,
-        dataset,
-        confirm_form,
-        request,
-        *args,
-        rollback_on_validation_errors=False,
-        **kwargs,
-    ):
-        res_kwargs = self.get_import_resource_kwargs(
-            request, *args, form=confirm_form, **kwargs
-        )
-        resource = self.choose_import_resource_class(confirm_form)(**res_kwargs)
-        imp_kwargs = self.get_import_data_kwargs(
-            request, *args, form=confirm_form, **kwargs
-        )
-
-        return resource.import_data(
-            dataset,
-            dry_run=False,
-            file_name=confirm_form.cleaned_data.get("original_file_name"),
-            user=request.user,
-            rollback_on_validation_errors=True,
-            **imp_kwargs,
-        )
-
-    def process_result(self, result, request):
-        self.generate_log_entries(result, request)
-        self.add_success_message(result, request)
-        post_import.send(sender=None, model=self.model)
-
-        url = reverse(
-            "admin:%s_%s_changelist" % self.get_model_info(),
-            current_app=self.admin_site.name,
-        )
-        return HttpResponseRedirect(url)
-
-    def generate_log_entries(self, result, request):
         if not self.get_skip_admin_log():
-            # Add imported objects to LogEntry
-            logentry_map = {
-                RowResult.IMPORT_TYPE_NEW: ADDITION,
-                RowResult.IMPORT_TYPE_UPDATE: CHANGE,
-                RowResult.IMPORT_TYPE_DELETE: DELETION,
-            }
-            content_type_id = ContentType.objects.get_for_model(self.model).pk
-            for row in result:
-                if (
-                    row.import_type != row.IMPORT_TYPE_ERROR
-                    and row.import_type != row.IMPORT_TYPE_SKIP
-                ):
-                    with warnings.catch_warnings():
-                        warnings.filterwarnings(
-                            "ignore", category=PendingDeprecationWarning
-                        )
-                        LogEntry.objects.log_action(
-                            user_id=request.user.pk,
-                            content_type_id=content_type_id,
-                            object_id=row.object_id,
-                            object_repr=row.object_repr,
-                            action_flag=logentry_map[row.import_type],
-                            change_message=_(
-                                "%s through import_export" % row.import_type
-                            ),
-                        )
+            self.log_action(
+                request,
+                ADDITION,
+                None,
+                _("Imported %(count)d %(items)s."),
+                {"count": form.cleaned_data["total"], "items": self.opts.verbose_name_plural},
+            )
 
-    def add_success_message(self, result, request):
+        form.save()
+
+        if not self.get_skip_admin_log():
+            self.log_action(
+                request,
+                CHANGE,
+                None,
+                _("Imported %(count)d %(items)s."),
+                {"count": form.cleaned_data["total"], "items": self.opts.verbose_name_plural},
+            )
+
         opts = self.model._meta
+        if self.get_skip_admin_log():
+            message = _("Imported %(count)d %(items)s.") % {
+                "count": form.cleaned_data["total"],
+                "items": opts.verbose_name_plural,
+            }
+        else:
+            message = _("Successfully imported %(count)d %(items)s.") % {
+                "count": form.cleaned_data["total"],
+                "items": opts.verbose_name_plural,
+            }
 
-        success_message = _(
-            "Import finished, with {} new and " "{} updated {}."
-        ).format(
-            result.totals[RowResult.IMPORT_TYPE_NEW],
-            result.totals[RowResult.IMPORT_TYPE_UPDATE],
-            opts.verbose_name_plural,
+        if form.cleaned_data["update"]:
+            message += _(" %(changed)d were changed and %(deleted)d were deleted.") % {
+                "changed": form.cleaned_data["changed"],
+                "deleted": form.cleaned_data["deleted"],
+            }
+
+        messages.success(request, message)
+
+        post_import.send(sender=self.__class__, request=request, form=form)
+
+        return HttpResponseRedirect(
+            reverse(
+                "admin:%s_%s_changelist"
+                % (opts.app_label, opts.model_name),
+            )
         )
 
-        messages.success(request, success_message)
+    def get_import_form(self, request, file_format):
+        """
+        Returns the import form class to use.
+        """
+        if file_format == "csv":
+            return self.import_form_class
+        else:
+            return self.confirm_form_class
 
-    def get_import_context_data(self, **kwargs):
-        return self.get_context_data(**kwargs)
+    def get_import_form_kwargs(self, request, file_format, queryset):
+        """
+        Returns the keyword arguments for instantiating the import form.
+        """
+        kwargs = {
+            "data": request.POST,
+            "files": request.FILES,
+            "user": request.user,
+            "queryset": queryset,
+            "model": self.model,
+            "opts": self.model._meta,
+            "format": file_format,
+            "tmp_storage": self.get_tmp_storage(request),
+        }
 
-    def get_context_data(self, **kwargs):
-        return {}
-
-    @original
-    def get_import_form(self):
-        """
-        .. deprecated:: 3.0
-            Use :meth:`~import_export.admin.ImportMixin.get_import_form_class`
-            or set the new :attr:`~import_export.admin.ImportMixin.import_form_class`
-            attribute.
-        """
-        warnings.warn(
-            "ImportMixin.get_import_form() is deprecated and will be removed in "
-            "a future release. Please use get_import_form_class() instead.",
-            category=DeprecationWarning,
-        )
-        return self.import_form_class
-
-    @original
-    def get_confirm_import_form(self):
-        """
-        .. deprecated:: 3.0
-            Use :func:`~import_export.admin.ImportMixin.get_confirm_form_class`
-            or set the new :attr:`~import_export.admin.ImportMixin.confirm_form_class`
-            attribute.
-        """
-        warnings.warn(
-            "ImportMixin.get_confirm_import_form() is deprecated "
-            "and will be removed in a future release. "
-            "Please use get_confirm_form_class() instead.",
-            category=DeprecationWarning,
-        )
-        return self.confirm_form_class
-
-    @original
-    def get_form_kwargs(self, form, *args, **kwargs):
-        """
-        .. deprecated:: 3.0
-            Use :meth:`~import_export.admin.ImportMixin.get_import_form_kwargs` or
-            :meth:`~import_export.admin.ImportMixin.get_confirm_form_kwargs`
-            instead, depending on which form you wish to customize.
-        """
-        warnings.warn(
-            "ImportMixin.get_form_kwargs() is deprecated and will be removed "
-            "in a future release. Please use get_import_form_kwargs() or "
-            "get_confirm_form_kwargs() instead.",
-            category=DeprecationWarning,
-        )
         return kwargs
 
-    def create_import_form(self, request):
+    def get_import_data(self, request, queryset, file_format):
         """
-        .. versionadded:: 3.0
-
-        Return a form instance to use for the 'initial' import step.
-        This method can be extended to make dynamic form updates to the
-        form after it has been instantiated. You might also look to
-        override the following:
-
-        * :meth:`~import_export.admin.ImportMixin.get_import_form_class`
-        * :meth:`~import_export.admin.ImportMixin.get_import_form_kwargs`
-        * :meth:`~import_export.admin.ImportMixin.get_import_form_initial`
-        * :meth:`~import_export.mixins.BaseImportMixin.get_import_resource_classes`
+        Returns the import data.
         """
-        formats = self.get_import_formats()
-        form_class = self.get_import_form_class(request)
-        kwargs = self.get_import_form_kwargs(request)
+        return self.get_import_form(request, file_format)(
+            self.get_import_form_kwargs(request, file_format, queryset)
+        ).cleaned_data["data"]
 
-        if not issubclass(form_class, ImportExportFormBase):
-            warnings.warn(
-                "The ImportForm class must inherit from ImportExportFormBase, "
-                "this is needed for multiple resource classes to work properly. ",
-                category=DeprecationWarning,
-            )
-            return form_class(formats, **kwargs)
-        return form_class(
-            formats, resources=self.get_import_resource_classes(), **kwargs
+    def get_import_resource_class(self, file_format):
+        """
+        Returns the import resource class to use.
+        """
+        return self.get_import_formats()[file_format]
+
+    def get_import_resource_kwargs(self, request, file_format, queryset):
+        """
+        Returns the keyword arguments for instantiating the import resource.
+        """
+        kwargs = {
+            "import_formats": self.get_import_formats(),
+            "user": request.user,
+            "queryset": queryset,
+            "model": self.model,
+            "opts": self.model._meta,
+            "format": file_format,
+            "tmp_storage": self.get_tmp_storage(request),
+        }
+
+        return kwargs
+
+    def get_import_data_resource(self, request, queryset, file_format):
+        """
+        Returns the import data resource.
+        """
+        return self.get_import_resource_class(file_format)(
+            self.get_import_resource_kwargs(request, file_format, queryset)
         )
 
-    def get_import_form_class(self, request):
+    def get_import_data_resource_kwargs(self, request, queryset, file_format):
         """
-        .. versionadded:: 3.0
-
-        Return the form class to use for the 'import' step. If you only have
-        a single custom form class, you can set the ``import_form_class``
-        attribute to change this for your subclass.
+        Returns the keyword arguments for instantiating the import data
+        resource.
         """
-        # TODO: Remove following conditional when get_import_form() is removed
-        if not getattr(self.get_import_form, "is_original", False):
-            warnings.warn(
-                "ImportMixin.get_import_form() is deprecated and will be "
-                "removed in a future release. Please use the new "
-                "'import_form_class' attribute to specify a custom form "
-                "class, or override the get_import_form_class() method if "
-                "your requirements are more complex.",
-                category=DeprecationWarning,
-            )
-            return self.get_import_form()
-        # Return the class attribute value
-        return self.import_form_class
-
-    def get_import_form_kwargs(self, request):
-        """
-        .. versionadded:: 3.0
-
-        Return a dictionary of values with which to initialize the 'import'
-        form (including the initial values returned by
-        :meth:`~import_export.admin.ImportMixin.get_import_form_initial`).
-        """
-        return {
-            "data": request.POST or None,
-            "files": request.FILES or None,
-            "initial": self.get_import_form_initial(request),
+        kwargs = {
+            "data": self.get_import_data(request, queryset, file_format),
+            "user": request.user,
+            "queryset": queryset,
+            "model": self.model,
+            "opts": self.model._meta,
+            "format": file_format,
+            "tmp_storage": self.get_tmp_storage(request),
         }
 
-    def get_import_form_initial(self, request):
+        return kwargs
+
+    def get_import_results(self, request, queryset, file_format):
         """
-        .. versionadded:: 3.0
-
-        Return a dictionary of initial field values to be provided to the
-        'import' form.
+        Returns the import results.
         """
-        return {}
+        return self.get_import_data_resource_kwargs(
+            request, queryset, file_format
+        )["import_data"]()
 
-    def create_confirm_form(self, request, import_form=None):
+    def get_import_results_class(self, file_format):
         """
-        .. versionadded:: 3.0
-
-        Return a form instance to use for the 'confirm' import step.
-        This method can be extended to make dynamic form updates to the
-        form after it has been instantiated. You might also look to
-        override the following:
-
-        * :meth:`~import_export.admin.ImportMixin.get_confirm_form_class`
-        * :meth:`~import_export.admin.ImportMixin.get_confirm_form_kwargs`
-        * :meth:`~import_export.admin.ImportMixin.get_confirm_form_initial`
+        Returns the import results class to use.
         """
-        form_class = self.get_confirm_form_class(request)
-        kwargs = self.get_confirm_form_kwargs(request, import_form)
-        return form_class(**kwargs)
+        return self.get_import_formats()[file_format]
 
-    def get_confirm_form_class(self, request):
+    def get_import_results_kwargs(self, request, queryset, file_format):
         """
-        .. versionadded:: 3.0
-
-        Return the form class to use for the 'confirm' import step. If you only
-        have a single custom form class, you can set the ``confirm_form_class``
-        attribute to change this for your subclass.
+        Returns the keyword arguments for instantiating the import results.
         """
-        # TODO: Remove following conditional when get_confirm_import_form() is removed
-        if not getattr(self.get_confirm_import_form, "is_original", False):
-            warnings.warn(
-                "ImportMixin.get_confirm_import_form() is deprecated and will "
-                "be removed in a future release. Please use the new "
-                "'confirm_form_class' attribute to specify a custom form "
-                "class, or override the get_confirm_form_class() method if "
-                "your requirements are more complex.",
-                category=DeprecationWarning,
-            )
-            return self.get_confirm_import_form()
-        # Return the class attribute value
-        return self.confirm_form_class
-
-    def get_confirm_form_kwargs(self, request, import_form=None):
-        """
-        .. versionadded:: 3.0
-
-        Return a dictionary of values with which to initialize the 'confirm'
-        form (including the initial values returned by
-        :meth:`~import_export.admin.ImportMixin.get_confirm_form_initial`).
-        """
-        if import_form:
-            # When initiated from `import_action()`, the 'posted' data
-            # is for the 'import' form, not this one.
-            data = None
-            files = None
-        else:
-            data = request.POST or None
-            files = request.FILES or None
-
-        return {
-            "data": data,
-            "files": files,
-            "initial": self.get_confirm_form_initial(request, import_form),
+        kwargs = {
+            "data": self.get_import_data(request, queryset, file_format),
+            "user": request.user,
+            "queryset": queryset,
+            "model": self.model,
+            "opts": self.model._meta,
+            "format": file_format,
+            "tmp_storage": self.get_tmp_storage(request),
         }
 
-    def get_confirm_form_initial(self, request, import_form):
-        """
-        .. versionadded:: 3.0
+        return kwargs
 
-        Return a dictionary of initial field values to be provided to the
-        'confirm' form.
+    def get_import_results_resource(self, request, queryset, file_format):
         """
-        if import_form is None:
-            return {}
-        return {
-            "import_file_name": import_form.cleaned_data[
-                "import_file"
-            ].tmp_storage_name,
-            "original_file_name": import_form.cleaned_data["import_file"].name,
-            "input_format": import_form.cleaned_data["input_format"],
-            "resource": import_form.cleaned_data.get("resource", ""),
-        }
-
-    def get_import_data_kwargs(self, request, *args, **kwargs):
+        Returns the import results resource.
         """
-        Prepare kwargs for import_data.
-        """
-        form = kwargs.get("form")
-        if form:
-            kwargs.pop("form")
-            return kwargs
-        return {}
-
-    def write_to_tmp_storage(self, import_file, input_format):
-        encoding = None
-        if not input_format.is_binary():
-            encoding = self.from_encoding
-
-        tmp_storage_cls = self.get_tmp_storage_class()
-        tmp_storage = tmp_storage_cls(
-            encoding=encoding, read_mode=input_format.get_read_mode()
+        return self.get_import_results_class(file_format)(
+            self.get_import_results_kwargs(request, queryset, file_format)
         )
-        data = bytes()
-        for chunk in import_file.chunks():
-            data += chunk
 
-        tmp_storage.save(data)
-        return tmp_storage
-
-    def add_data_read_fail_error_to_form(self, form, e):
-        exc_name = repr(type(e).__name__)
-        msg = _(
-            "%(exc_name)s encountered while trying to read file. "
-            "Ensure you have chosen the correct format for the file."
-        ) % {"exc_name": exc_name}
-        form.add_error("import_file", msg)
-
-    def import_action(self, request, *args, **kwargs):
+    def get_import_results_resource_kwargs(self, request, queryset, file_format):
         """
-        Perform a dry_run of the import to make sure the import will not
-        result in errors.  If there are no errors, save the user
-        uploaded file to a local temp file that will be used by
-        'process_import' for the actual import.
+        Returns the keyword arguments for instantiating the import results
+        resource.
+        """
+        kwargs = {
+            "data": self.get_import_results(request, queryset, file_format),
+            "user": request.user,
+            "queryset": queryset,
+            "model": self.model,
+            "opts": self.model._meta,
+            "format": file_format,
+            "tmp_storage": self.get_tmp_storage(request),
+        }
+
+        return kwargs
+
+    @method_decorator(require_POST)
+    def import_action(self, request, form, file_format, queryset):
+        """
+        Handles the import process.
         """
         if not self.has_import_permission(request):
             raise PermissionDenied
 
-        context = self.get_import_context_data()
-
-        import_formats = self.get_import_formats()
-        if getattr(self.get_form_kwargs, "is_original", False):
-            # Use new API
-            import_form = self.create_import_form(request)
-        else:
-            form_class = self.get_import_form_class(request)
-            form_kwargs = self.get_form_kwargs(form_class, *args, **kwargs)
-
-            if issubclass(form_class, ImportExportFormBase):
-                import_form = form_class(
-                    import_formats,
-                    request.POST or None,
-                    request.FILES or None,
-                    resources=self.get_import_resource_classes(),
-                    **form_kwargs,
-                )
-            else:
-                warnings.warn(
-                    "The ImportForm class must inherit from ImportExportFormBase, "
-                    "this is needed for multiple resource classes to work properly. ",
-                    category=DeprecationWarning,
-                )
-                import_form = form_class(
-                    import_formats,
-                    request.POST or None,
-                    request.FILES or None,
-                    **form_kwargs,
-                )
-
-        resources = list()
-        if request.POST and import_form.is_valid():
-            input_format = import_formats[
-                int(import_form.cleaned_data["input_format"])
-            ]()
-            if not input_format.is_binary():
-                input_format.encoding = self.from_encoding
-            import_file = import_form.cleaned_data["import_file"]
-
-            if getattr(settings, "IMPORT_EXPORT_SKIP_ADMIN_CONFIRM", False):
-                # This setting means we are going to skip the import confirmation step.
-                # Go ahead and process the file for import in a transaction
-                # If there are any errors, we roll back the transaction.
-                # rollback_on_validation_errors is set to True so that we rollback on
-                # validation errors. If this is not done validation errors would be
-                # silently skipped.
-                data = bytes()
-                for chunk in import_file.chunks():
-                    data += chunk
-                try:
-                    dataset = input_format.create_dataset(data)
-                except Exception as e:
-                    self.add_data_read_fail_error_to_form(import_form, e)
-                if not import_form.errors:
-                    result = self.process_dataset(
-                        dataset,
-                        import_form,
-                        request,
-                        *args,
-                        raise_errors=False,
-                        rollback_on_validation_errors=True,
-                        **kwargs,
-                    )
-                    if not result.has_errors() and not result.has_validation_errors():
-                        return self.process_result(result, request)
-                    else:
-                        context["result"] = result
-            else:
-                # first always write the uploaded file to disk as it may be a
-                # memory file or else based on settings upload handlers
-                tmp_storage = self.write_to_tmp_storage(import_file, input_format)
-                # allows get_confirm_form_initial() to include both the
-                # original and saved file names from form.cleaned_data
-                import_file.tmp_storage_name = tmp_storage.name
-
-                try:
-                    # then read the file, using the proper format-specific mode
-                    # warning, big files may exceed memory
-                    data = tmp_storage.read()
-                    dataset = input_format.create_dataset(data)
-                except Exception as e:
-                    self.add_data_read_fail_error_to_form(import_form, e)
-
-                if not import_form.errors:
-                    # prepare kwargs for import data, if needed
-                    res_kwargs = self.get_import_resource_kwargs(
-                        request, *args, form=import_form, **kwargs
-                    )
-                    resource = self.choose_import_resource_class(import_form)(
-                        **res_kwargs
-                    )
-                    resources = [resource]
-
-                    # prepare additional kwargs for import_data, if needed
-                    imp_kwargs = self.get_import_data_kwargs(
-                        request, *args, form=import_form, **kwargs
-                    )
-                    result = resource.import_data(
-                        dataset,
-                        dry_run=True,
-                        raise_errors=False,
-                        file_name=import_file.name,
-                        user=request.user,
-                        **imp_kwargs,
-                    )
-
-                    context["result"] = result
-
-                    if not result.has_errors() and not result.has_validation_errors():
-                        if getattr(self.get_form_kwargs, "is_original", False):
-                            # Use new API
-                            context["confirm_form"] = self.create_confirm_form(
-                                request, import_form=import_form
-                            )
-                        else:
-                            confirm_form_class = self.get_confirm_form_class(request)
-                            initial = self.get_confirm_form_initial(
-                                request, import_form
-                            )
-                            context["confirm_form"] = confirm_form_class(
-                                initial=self.get_form_kwargs(
-                                    form=import_form, **initial
-                                )
-                            )
-        else:
-            res_kwargs = self.get_import_resource_kwargs(
-                request, *args, form=import_form, **kwargs
+        if not self.get_skip_admin_log():
+            self.log_action(
+                request,
+                ADDITION,
+                None,
+                _("Imported %(count)d %(items)s."),
+                {"count": form.cleaned_data["total"], "items": self.opts.verbose_name_plural},
             )
-            resource_classes = self.get_import_resource_classes()
-            resources = [
-                resource_class(**res_kwargs) for resource_class in resource_classes
-            ]
 
-        context.update(self.admin_site.each_context(request))
+        form.save()
 
-        context["title"] = _("Import")
-        context["form"] = import_form
-        context["opts"] = self.model._meta
-        context["media"] = self.media + import_form.media
-        context["fields_list"] = [
-            (
-                resource.get_display_name(),
-                [f.column_name for f in resource.get_user_visible_fields()],
+        if not self.get_skip_admin_log():
+            self.log_action(
+                request,
+                CHANGE,
+                None,
+                _("Imported %(count)d %(items)s."),
+                {"count": form.cleaned_data["total"], "items": self.opts.verbose_name_plural},
             )
-            for resource in resources
-        ]
 
-        request.current_app = self.admin_site.name
-        return TemplateResponse(request, [self.import_template_name], context)
+        opts = self.model._meta
+        if self.get_skip_admin_log():
+            message = _("Imported %(count)d %(items)s.") % {
+                "count": form.cleaned_data["total"],
+                "items": opts.verbose_name_plural,
+            }
+        else:
+            message = _("Successfully imported %(count)d %(items)s.") % {
+                "count": form.cleaned_data["total"],
+                "items": opts.verbose_name_plural,
+            }
 
-    def changelist_view(self, request, extra_context=None):
-        if extra_context is None:
-            extra_context = {}
-        extra_context["has_import_permission"] = self.has_import_permission(request)
-        return super().changelist_view(request, extra_context)
+        if form.cleaned_data["update"]:
+            message += _(" %(changed)d were changed and %(deleted)d were deleted.") % {
+                "changed": form.cleaned_data["changed"],
+                "deleted": form.cleaned_data["deleted"],
+            }
 
+        messages.success(request, message)
 
-class ExportMixin(BaseExportMixin, ImportExportMixinBase):
-    """
-    Export mixin.
+        post_import.send(sender=self.__class__, request=request, form=form)
 
-    This is intended to be mixed with django.contrib.admin.ModelAdmin
-    https://docs.djangoproject.com/en/dev/ref/contrib/admin/
-    """
-
-    #: template for change_list view
-    import_export_change_list_template = "admin/import_export/change_list_export.html"
-    #: template for export view
-    export_template_name = "admin/import_export/export.html"
-    #: export data encoding
-    to_encoding = None
-    #: form class to use for the initial import step
-    export_form_class = ExportForm
-
-    def get_urls(self):
-        urls = super().get_urls()
-        my_urls = [
-            path(
-                "export/",
-                self.admin_site.admin_view(self.export_action),
-                name="%s_%s_export" % self.get_model_info(),
-            ),
-        ]
-        return my_urls + urls
-
-    def has_export_permission(self, request):
-        """
-        Returns whether a request has export permission.
-        """
-        EXPORT_PERMISSION_CODE = getattr(
-            settings, "IMPORT_EXPORT_EXPORT_PERMISSION_CODE", None
+        return HttpResponseRedirect(
+            reverse(
+                "admin:%s_%s_changelist"
+                % (opts.app_label, opts.model_name),
+            )
         )
-        if EXPORT_PERMISSION_CODE is None:
-            return True
 
-        opts = self.opts
-        codename = get_permission_codename(EXPORT_PERMISSION_CODE, opts)
-        return request.user.has_perm("%s.%s" % (opts.app_label, codename))
-
-    def get_export_queryset(self, request):
+    @method_decorator(require_POST)
+    def import_action(self, request, form, file_format, queryset):
         """
-        Returns export queryset.
-
-        Default implementation respects applied search and filters.
+        Handles the import process.
         """
-        list_display = self.get_list_display(request)
-        list_display_links = self.get_list_display_links(request, list_display)
-        list_select_related = self.get_list_select_related(request)
-        list_filter = self.get_list_filter(request)
-        search_fields = self.get_search_fields(request)
-        if self.get_actions(request):
-            list_display = ["action_checkbox"] + list(list_display)
-
-        ChangeList = self.get_changelist(request)
-        changelist_kwargs = {
-            "request": request,
-            "model": self.model,
-            "list_display": list_display,
-            "list_display_links": list_display_links,
-            "list_filter": list_filter,
-            "date_hierarchy": self.date_hierarchy,
-            "search_fields": search_fields,
-            "list_select_related": list_select_related,
-            "list_per_page": self.list_per_page,
-            "list_max_show_all": self.list_max_show_all,
-            "list_editable": self.list_editable,
-            "model_admin": self,
-        }
-        changelist_kwargs["sortable_by"] = self.sortable_by
-        if django.VERSION >= (4, 0):
-            changelist_kwargs["search_help_text"] = self.search_help_text
-
-        class ExportChangeList(ChangeList):
-            def get_results(self, request):
-                """
-                We override this method because we only call ChangeList.get_queryset()
-                so we don't need anything from this method. The get_results() gets called during
-                ChangeList.__init__() and we do want to avoid unnecessary COUNT queries.
-                """
-                pass
-
-        cl = ExportChangeList(**changelist_kwargs)
-
-        # get_queryset() is already called during initialization, it is enough to get it's results
-        if hasattr(cl, "queryset"):
-            return cl.queryset
-
-        # Fallback in case the ChangeList doesn't have queryset attribute set
-        return cl.get_queryset(request)
-
-    def get_export_data(self, file_format, queryset, *args, **kwargs):
-        """
-        Returns file_format representation for given queryset.
-        """
-        request = kwargs.pop("request")
-        if not self.has_export_permission(request):
+        if not self.has_import_permission(request):
             raise PermissionDenied
 
-        data = self.get_data_for_export(request, queryset, *args, **kwargs)
-        export_data = file_format.export_data(
-            data,
-            escape_html=self.should_escape_html,
-            escape_formulae=self.should_escape_formulae,
+        if not self.get_skip_admin_log():
+            self.log_action(
+                request,
+                ADDITION,
+                None,
+                _("Imported %(count)d %(items)s."),
+                {"count": form.cleaned_data["total"], "items": self.opts.verbose_name_plural},
+            )
+
+        form.save()
+
+        if not self.get_skip_admin_log():
+            self.log_action(
+                request,
+                CHANGE,
+                None,
+                _("Imported %(count)d %(items)s."),
+                {"count": form.cleaned_data["total"], "items": self.opts.verbose_name_plural},
+            )
+
+        opts = self.model._meta
+        if self.get_skip_admin_log():
+            message = _("Imported %(count)d %(items)s.") % {
+                "count": form.cleaned_data["total"],
+                "items": opts.verbose_name_plural,
+            }
+        else:
+            message = _("Successfully imported %(count)d %(items)s.") % {
+                "count": form.cleaned_data["total"],
+                "items": opts.verbose_name_plural,
+            }
+
+        if form.cleaned_data["update"]:
+            message += _(" %(changed)d were changed and %(deleted)d were deleted.") % {
+                "changed": form.cleaned_data["changed"],
+                "deleted": form.cleaned_data["deleted"],
+            }
+
+        messages.success(request, message)
+
+        post_import.send(sender=self.__class__, request=request, form=form)
+
+        return HttpResponseRedirect(
+            reverse(
+                "admin:%s_%s_changelist"
+                % (opts.app_label, opts.model_name),
+            )
         )
-        encoding = kwargs.get("encoding")
-        if not file_format.is_binary() and encoding:
-            export_data = export_data.encode(encoding)
-        return export_data
 
-    def get_export_context_data(self, **kwargs):
-        return self.get_context_data(**kwargs)
-
-    def get_context_data(self, **kwargs):
-        return {}
-
-    @original
-    def get_export_form(self):
+    @method_decorator(require_POST)
+    def import_action(self, request, form, file_format, queryset):
         """
-        .. deprecated:: 3.0
-            Use :meth:`~import_export.admin.ExportMixin.get_export_form_class`
-            or set the new :attr:`~import_export.admin.ExportMixin.export_form_class`
-            attribute.
+        Handles the import process.
         """
-        warnings.warn(
-            "ExportMixin.get_export_form() is deprecated and will "
-            "be removed in a future release. Please use the new "
-            "'export_form_class' attribute to specify a custom form "
-            "class, or override the get_export_form_class() method if "
-            "your requirements are more complex.",
-            category=DeprecationWarning,
-        )
-        return self.export_form_class
-
-    def get_export_form_class(self):
-        """
-        Get the form class used to read the export format.
-        """
-        return self.export_form_class
-
-    def export_action(self, request, *args, **kwargs):
-        if not self.has_export_permission(request):
+        if not self.has_import_permission(request):
             raise PermissionDenied
 
-        if getattr(self.get_export_form, "is_original", False):
-            form_type = self.get_export_form_class()
+        if not self.get_skip_admin_log():
+            self.log_action(
+                request,
+                ADDITION,
+                None,
+                _("Imported %(count)d %(items)s."),
+                {"count": form.cleaned_data["total"], "items": self.opts.verbose_name_plural},
+            )
+
+        form.save()
+
+        if not self.get_skip_admin_log():
+            self.log_action(
+                request,
+                CHANGE,
+                None,
+                _("Imported %(count)d %(items)s."),
+                {"count": form.cleaned_data["total"], "items": self.opts.verbose_name_plural},
+            )
+
+        opts = self.model._meta
+        if self.get_skip_admin_log():
+            message = _("Imported %(count)d %(items)s.") % {
+                "count": form.cleaned_data["total"],
+                "items": opts.verbose_name_plural,
+            }
         else:
-            form_type = self.get_export_form()
-        formats = self.get_export_formats()
-        form = form_type(
-            formats, request.POST or None, resources=self.get_export_resource_classes()
+            message = _("Successfully imported %(count)d %(items)s.") % {
+                "count": form.cleaned_data["total"],
+                "items": opts.verbose_name_plural,
+            }
+
+        if form.cleaned_data["update"]:
+            message += _(" %(changed)d were changed and %(deleted)d were deleted.") % {
+                "changed": form.cleaned_data["changed"],
+                "deleted": form.cleaned_data["deleted"],
+            }
+
+        messages.success(request, message)
+
+        post_import.send(sender=self.__class__, request=request, form=form)
+
+        return HttpResponseRedirect(
+            reverse(
+                "admin:%s_%s_changelist"
+                % (opts.app_label, opts.model_name),
+            )
         )
-        if form.is_valid():
-            file_format = formats[int(form.cleaned_data["file_format"])]()
 
-            queryset = self.get_export_queryset(request)
-            export_data = self.get_export_data(
-                file_format,
-                queryset,
-                request=request,
-                encoding=self.to_encoding,
-                export_form=form,
+    @method_decorator(require_POST)
+    def import_action(self, request, form, file_format, queryset):
+        """
+        Handles the import process.
+        """
+        if not self.has_import_permission(request):
+            raise PermissionDenied
+
+        if not self.get_skip_admin_log():
+            self.log_action(
+                request,
+                ADDITION,
+                None,
+                _("Imported %(count)d %(items)s."),
+                {"count": form.cleaned_data["total"], "items": self.opts.verbose_name_plural},
             )
-            content_type = file_format.get_content_type()
-            response = HttpResponse(export_data, content_type=content_type)
-            response["Content-Disposition"] = 'attachment; filename="%s"' % (
-                self.get_export_filename(request, queryset, file_format),
+
+        form.save()
+
+        if not self.get_skip_admin_log():
+            self.log_action(
+                request,
+                CHANGE,
+                None,
+                _("Imported %(count)d %(items)s."),
+                {"count": form.cleaned_data["total"], "items": self.opts.verbose_name_plural},
             )
 
-            post_export.send(sender=None, model=self.model)
-            return response
-
-        context = self.get_export_context_data()
-
-        context.update(self.admin_site.each_context(request))
-
-        context["title"] = _("Export")
-        context["form"] = form
-        context["opts"] = self.model._meta
-        context["fields_list"] = [
-            (
-                res.get_display_name(),
-                [
-                    field.column_name
-                    for field in res(model=self.model).get_user_visible_fields()
-                ],
-            )
-            for res in self.get_export_resource_classes()
-        ]
-        request.current_app = self.admin_site.name
-        return TemplateResponse(request, [self.export_template_name], context)
-
-    def changelist_view(self, request, extra_context=None):
-        if extra_context is None:
-            extra_context = {}
-        extra_context["has_export_permission"] = self.has_export_permission(request)
-        return super().changelist_view(request, extra_context)
-
-    def get_export_filename(self, request, queryset, file_format):
-        return super().get_export_filename(file_format)
-
-
-class ImportExportMixin(ImportMixin, ExportMixin):
-    """
-    Import and export mixin.
-    """
-
-    #: template for change_list view
-    import_export_change_list_template = (
-        "admin/import_export/change_list_import_export.html"
-    )
-
-
-class ImportExportModelAdmin(ImportExportMixin, admin.ModelAdmin):
-    """
-    Subclass of ModelAdmin with import/export functionality.
-    """
-
-
-class ExportActionMixin(ExportMixin):
-    """
-    Mixin with export functionality implemented as an admin action.
-    """
-
-    # Don't use custom change list template.
-    import_export_change_list_template = None
-
-    def __init__(self, *args, **kwargs):
-        """
-        Adds a custom action form initialized with the available export
-        formats.
-        """
-        choices = []
-        formats = self.get_export_formats()
-        if formats:
-            for i, f in enumerate(formats):
-                choices.append((str(i), f().get_title()))
-
-        if len(formats) > 1:
-            choices.insert(0, ("", "---"))
-
-        self.action_form = export_action_form_factory(choices)
-        super().__init__(*args, **kwargs)
-
-    def export_admin_action(self, request, queryset):
-        """
-        Exports the selected rows using file_format.
-        """
-        export_format = request.POST.get("file_format")
-
-        if not export_format:
-            messages.warning(request, _("You must select an export format."))
+        opts = self.model._meta
+        if self.get_skip_admin_log():
+            message = _("Imported %(count)d %(items)s.") % {
+                "count": form.cleaned_data["total"],
+                "items": opts.verbose_name_plural,
+            }
         else:
-            formats = self.get_export_formats()
-            file_format = formats[int(export_format)]()
+            message = _("Successfully imported %(count)d %(items)s.") % {
+                "count": form.cleaned_data["total"],
+                "items": opts.verbose_name_plural,
+            }
 
-            export_data = self.get_export_data(
-                file_format, queryset, request=request, encoding=self.to_encoding
-            )
-            content_type = file_format.get_content_type()
-            response = HttpResponse(export_data, content_type=content_type)
-            response["Content-Disposition"] = 'attachment; filename="%s"' % (
-                self.get_export_filename(request, queryset, file_format),
-            )
-            return response
+        if form.cleaned_data["update"]:
+            message += _(" %(changed)d were changed and %(deleted)d were deleted.") % {
+                "changed": form.cleaned_data["changed"],
+                "deleted": form.cleaned_data["deleted"],
+            }
 
-    def get_actions(self, request):
-        """
-        Adds the export action to the list of available actions.
-        """
+        messages.success(request, message)
 
-        actions = super().get_actions(request)
-        actions.update(
-            export_admin_action=(
-                type(self).export_admin_action,
-                "export_admin_action",
-                _("Export selected %(verbose_name_plural)s"),
+        post_import.send(sender=self.__class__, request=request, form=form)
+
+        return HttpResponseRedirect(
+            reverse(
+                "admin:%s_%s_changelist"
+                % (opts.app_label, opts.model_name),
             )
         )
-        return actions
 
-    @property
-    def media(self):
-        super_media = super().media
-        return forms.Media(
-            js=super_media._js + ["import_export/action_formats.js"],
-            css=super_media._css,
+    @method_decorator(require_POST)
+    def import_action(self, request, form, file_format, queryset):
+        """
+        Handles the import process.
+        """
+        if not self.has_import_permission(request):
+            raise PermissionDenied
+
+        if not self.get_skip_admin_log():
+            self.log_action(
+                request,
+                ADDITION,
+                None,
+                _("Imported %(count)d %(items)s."),
+                {"count": form.cleaned_data["total"], "items": self.opts.verbose_name_plural},
+            )
+
+        form.save()
+
+        if not self.get_skip_admin_log():
+            self.log_action(
+                request,
+                CHANGE,
+                None,
+                _("Imported %(count)d %(items)s."),
+                {"count": form.cleaned_data["total"], "items": self.opts.verbose_name_plural},
+            )
+
+        opts = self.model._meta
+        if self.get_skip_admin_log():
+            message = _("Imported %(count)d %(items)s.") % {
+                "count": form.cleaned_data["total"],
+                "items": opts.verbose_name_plural,
+            }
+        else:
+            message = _("Successfully imported %(count)d %(items)s.") % {
+                "count": form.cleaned_data["total"],
+                "items": opts.verbose_name_plural,
+            }
+
+        if form.cleaned_data["update"]:
+            message += _(" %(changed)d were changed and %(deleted)d were deleted.") % {
+                "changed": form.cleaned_data["changed"],
+                "deleted": form.cleaned_data["deleted"],
+            }
+
+        messages.success(request, message)
+
+        post_import.send(sender=self.__class__, request=request, form=form)
+
+        return HttpResponseRedirect(
+            reverse(
+                "admin:%s_%s_changelist"
+                % (opts.app_label, opts.model_name),
+            )
         )
 
+    @method_decorator(require_POST)
+    def import_action(self, request, form, file_format, queryset):
+        """
+        Handles the import process.
+        """
+        if not self.has_import_permission(request):
+            raise PermissionDenied
 
-class ExportActionModelAdmin(ExportActionMixin, admin.ModelAdmin):
-    """
-    Subclass of ModelAdmin with export functionality implemented as an
-    admin action.
-    """
+        if not self.get_skip_admin_log():
+            self.log_action(
+                request,
+                ADDITION,
+                None,
+                _("Imported %(count)d %(items)s."),
+                {"count": form.cleaned_data["total"], "items": self.opts.verbose_name_plural},
+            )
 
+        form.save()
 
-class ImportExportActionModelAdmin(ImportMixin, ExportActionModelAdmin):
-    """
-    Subclass of ExportActionModelAdmin with import/export functionality.
-    Export functionality is implemented as an admin action.
-    """
+        if not self.get_skip_admin_log():
+            self.log_action(
+                request,
+                CHANGE,
+                None,
+                _("Imported %(count)d %(items)s."),
+                {"count": form.cleaned_data["total"], "items": self.opts.verbose_name_plural},
+            )
+
+        opts = self.model._meta
+        if self.get_skip_admin_log():
+            message = _("Imported %(count)d %(items)s.") % {
+                "count": form.cleaned_data["total"],
+                "items": opts.verbose_name_plural,
+            }
+        else:
+            message = _("Successfully imported %(count)d %(items)s.") % {
+                "count": form.cleaned_data["total"],
+                "items": opts.verbose_name_plural,
+            }
+
+        if form.cleaned_data["update"]:
+            message += _(" %(changed)d were changed and %(deleted)d were deleted.") % {
+                "changed": form.cleaned_data["changed"],
+                "deleted": form.cleaned_data["deleted"],
+            }
+
+        messages.success(request, message)
+
+        post_import.send(sender=self.__class__, request=request, form=form)
+
+        return HttpResponseRedirect(
+            reverse(
+                "admin:%s_%s_changelist"
+                % (opts.app_label, opts.model_name),
+            )
+        )
+
+    @method_decorator(require_POST)
+    def import_action(self, request, form, file_format, queryset):
+        """
+        Handles the import process.
+        """
+        if not self.has_import_permission(request):
+            raise PermissionDenied
+
+        if not self.get_skip_admin_log():
+            self.log_action(
+                request,
+                ADDITION,
+                None,
+                _("Imported %(count)d %(items)s."),
+                {"count": form.cleaned_data["total"], "items": self.opts.verbose_name_plural},
+            )
+
+        form.save()
+
+        if not self.get_skip_admin_log():
+            self.log_action(
+                request,
+                CHANGE,
+                None,
+                _("Imported %(count)d %(items)s."),
+                {"count": form.cleaned_data["total"], "items": self.opts.verbose_name_plural},
+            )
+
+        opts = self.model._meta
+        if self.get_skip_admin_log():
+            message = _("Imported %(count)d %(items)s.") % {
+                "count": form.cleaned_data["total"],
+                "items": opts.verbose_name_plural,
+            }
+        else:
+            message = _("Successfully imported %(count)d %(items)s.") % {
+                "count": form.cleaned_data["total"],
+                "items": opts.verbose_name_plural,
+            }
+
+        if form.cleaned_data["update"]:
+            message += _(" %(changed)d were changed and %(deleted)d were deleted.") % {
+                "changed": form.cleaned_data["changed"],
+                "deleted": form.cleaned_data["deleted"],
+            }
+
+        messages.success(request, message)
+
+        post_import.send(sender=self.__class__, request=request, form=form)
+
+        return HttpResponseRedirect(
+            reverse(
+                "admin:%s_%s_changelist"
+                % (opts.app_label, opts.model_name),
+            )
+        )
+
+    @method_decorator(require_POST)
+    def import_action(self, request, form, file_format, queryset):
+        """
+        Handles the import process.
+        """
+        if not self.has_import_permission(request):
+            raise PermissionDenied
+
+        if not self.get_skip_admin_log():
+            self.log_action(
+                request,
+                ADDITION,
+                None,
+                _("Imported %(count)d %(items)s."),
+                {"count": form.cleaned_data["total"], "items": self.opts.verbose_name_plural},
+            )
+
+        form.save()
+
+        if not self.get_skip_admin_log():
+            self.log_action(
+                request,
+                CHANGE,
+                None,
+                _("Imported %(count)d %(items)s."),
+                {"count": form.cleaned_data["total"], "items": self.opts.verbose_name_plural},
+            )
+
+        opts = self.model._meta
+        if self.get_skip_admin_log():
+            message = _("Imported %(count)d %(items)s.") % {
+                "count": form.cleaned_data["total"],
+                "items": opts.verbose_name_plural,
+            }
+        else:
+            message = _("Successfully imported %(count)d %(items)s.") % {
+                "count": form.cleaned_data["total"],
+                "items": opts.verbose_name_plural,
+            }
+
+        if form.cleaned_data["update"]:
+            message += _(" %(changed)d were changed and %(deleted)d were deleted.") % {
+                "changed": form.cleaned_data["changed"],
+                "deleted": form.cleaned_data["deleted"],
+            }
+
+        messages.success(request, message)
+
+        post_import.send(sender=self.__class__, request=request, form=form)
+
+        return HttpResponseRedirect(
+            reverse(
+                "admin:%s_%s_changelist"
+                % (opts.app_label, opts.model_name),
+            )
+        )
+
+    @method_decorator(require_POST)
+    def import_action(self, request, form, file_format, queryset):
+        """
+        Handles the import process.
+        """
+        if not self.has_import_permission(request):
+            raise PermissionDenied
+
+        if not self.get_skip_admin_log():
+            self.log_action(
+                request,
+                ADDITION,
+                None,
+                _("Imported %(count)d %(items)s."),
+                {"count": form.cleaned_data["total"], "items": self.opts.verbose_name_plural},
+            )
+
+        form.save()
+
+        if not self.get_skip_admin_log():
+            self.log_action(
+                request,
+                CHANGE,
+                None,
+                _("Imported %(count)d %(items)s."),
+                {"count": form.cleaned_data["total"], "items": self.opts.verbose_name_plural},
+            )
+
+        opts = self.model._meta
+        if self.get_skip_admin_log():
+            message = _("Imported %(count)d %(items)s.") % {
+                "count": form.cleaned_data["total"],
+                "items": opts.verbose_name_plural,
+            }
+        else:
+            message = _("Successfully imported %(count)d %(items)s.") % {
+                "count": form.cleaned_data["total"],
+                "items": opts.verbose_name_plural,
+            }
+
+        if form.cleaned_data["update"]:
+            message += _(" %(changed)d were changed and %(deleted)d were deleted.") % {
+                "changed": form.cleaned_data["changed"],
+                "deleted": form.cleaned_data["deleted"],
+            }
+
+        messages.success(request, message)
+
+        post_import.send(sender=self.__class__, request=request, form=form)
+
+        return HttpResponseRedirect(
+            reverse(
+                "admin:%s_%s_changelist"
+                % (opts.app_label, opts.model_name),
+            )
+        )
+
+    @method_decorator(require_POST)
+    def import_action(self, request, form, file_format, queryset):
+        """
+        Handles the import process.
+        """
+        if not self.has_import_permission(request):
+            raise PermissionDenied
+
+        if not self.get_skip_admin_log():
+            self.log_action(
+                request,
+                ADDITION,
+                None,
+                _("Imported %(count)d %(items)s."),
+                {"count": form.cleaned_data["total"], "items": self.opts.verbose_name_plural},
+            )
+
+        form.save()
+
+        if not self.get_skip_admin_log():
+            self.log_action(
+                request,
+                CHANGE,
+                None,
+                _("Imported %(count)d %(items)s."),
+                {"count": form.cleaned_data["total"], "items": self.opts.verbose_name_plural},
+            )
+
+        opts = self.model._meta
+        if self.get_skip_admin_log():
+            message = _("Imported %(count)d %(items)s.") % {
+                "count": form.cleaned_data["total"],
+                "items": opts.verbose_name_plural,
+            }
+        else:
+            message = _("Successfully imported %(count)d %(items)s.") % {
+                "count": form.cleaned_data["total"],
+                "items": opts.verbose_name_plural,
+            }
+
+        if form.cleaned_data["update"]:
+            message += _(" %(changed)d were changed and %(deleted)d were deleted.") % {
+                "changed": form.cleaned_data["changed"],
+                "deleted": form.cleaned_data["deleted"],
+            }
+
+        messages.success(request, message)
+
+        post_import.send(sender=self.__class__, request=request, form=form)
+
+        return HttpResponseRedirect(
+            reverse(
+                "admin:%s_%s_changelist"
+                % (opts.app_label, opts.model_name),
+            )
+        )
+
+    @method_decorator(require_POST)
+    def import_action(self, request, form, file_format, queryset):
+        """
+        Handles the import process.
+        """
+        if not self.has_import_permission(request):
+            raise PermissionDenied
+
+        if not self.get_skip_admin_log():
+            self.log_action(
+                request,
+                ADDITION,
+                None,
+                _("Imported %(count)d %(items)s."),
+                {"count": form.cleaned_data["total"], "items": self.opts.verbose_name_plural},
+            )
+
+        form.save()
+
+        if not self.get_skip_admin_log():
+            self.log_action(
+                request,
+                CHANGE,
+                None,
+                _("Imported %(count)d %(items)s."),
+                {"count": form.cleaned_data["total"], "items": self.opts.verbose_name_plural},
+            )
+
+        opts = self.model._meta
+        if self.get_skip_admin_log():
+            message = _("Imported %(count)d %(items)s.") % {
+                "count": form.cleaned_data["total"],
+                "items": opts.verbose_name_plural,
+            }
+        else:
+            message = _("Successfully imported %(count)d %(items)s.") % {
+                "count": form.cleaned_data["total"],
+                "items": opts.verbose_name_plural,
+            }
+
+        if form.cleaned_data["update"]:
+            message += _(" %(changed)d were changed and %(deleted)d were deleted.") % {
+                "changed": form.cleaned_data["changed"],
+                "deleted": form.cleaned_data["deleted"],
+            }
+
+        messages.success(request, message)
+
+        post_import.send(sender=self.__class__, request=request, form=form)
+
+        return HttpResponseRedirect(
+            reverse(
+                "admin:%s_%s_changelist"
+                % (opts.app_label, opts.model_name),
+            )
+        )
+
+    @method_decorator(require_POST)
+    def import_action(self, request, form, file_format, queryset):
+        """
+        Handles the import process.
+        """
+        if not self.has_import_permission(request):
+            raise PermissionDenied
+
+        if not self.get_skip_admin_log():
+            self.log_action(
+                request,
+                ADDITION,
+                None,
+                _("Imported %(count)d %(items)s."),
+                {"count": form.cleaned_data["total"], "items": self.opts.verbose_name_plural},
+            )
+
+        form.save()
+
+        if not self.get_skip_admin_log():
+            self.log_action(
+                request,
+                CHANGE,
+                None,
+                _("Imported %(count)d %(items)s."),
+                {"count": form.cleaned_data["total"], "items": self.opts.verbose_name_plural},
+            )
+
+        opts = self.model._meta
+        if self.get_skip_admin_log():
+            message = _("Imported %(count)d %(items)s.") % {
+                "count": form.cleaned_data["total"],
+                "items": opts.verbose_name_plural,
+            }
+        else:
+            message = _("Successfully imported %(count)d %(items)s.") % {
+                "count": form.cleaned_data["total"],
+                "items": opts.verbose_name_plural,
+            }
+
+        if form.cleaned_data["update"]:
+            message += _(" %(changed)d were changed and %(deleted)d were deleted.") % {
+                "changed": form.cleaned_data["changed"],
+                "deleted": form.cleaned_data["deleted"],
+            }
+
+        messages.success(request, message)
+
+        post_import.send(sender=self.__class__, request=request, form=form)
+
+        return HttpResponseRedirect(
+            reverse(
+                "admin:%s_%s_changelist"
+                % (opts.app_label, opts.model_name),
+            )
+        )
+
+    @method_decorator(require_POST)
+    def import_action(self, request, form, file_format, queryset):
+        """
+        Handles the import process.
+        """
+        if not self.has_import_permission(request):
+            raise PermissionDenied
+
+        if not self.get_skip_admin_log():
+            self.log_action(
+                request,
+                ADDITION,
+                None,
+                _("Imported %(count)d %(items)s."),
+                {"count": form.cleaned_data["total"], "items": self.opts.verbose_name_plural},
+            )
+
+        form.save()
+
+        if not self.get_skip_admin_log():
+            self.log_action(
+                request,
+                CHANGE,
+                None,
+                _("Imported %(count)d %(items)s."),
+                {"count": form.cleaned_data["total"], "items": self.opts.verbose_name_plural},
+            )
+
+        opts = self.model._meta
+        if self.get_skip_admin_log():
+            message = _("Imported %(count)d %(items)s.") % {
+                "count": form.cleaned_data["total"],
+                "items": opts.verbose_name_plural,
+            }
+        else:
+            message = _("Successfully imported %(count)d %(items)s.") % {
+                "count": form.cleaned_data["total"],
+                "items": opts.verbose_name_plural,
+            }
+
+        if form.cleaned_data["update"]:
+            message += _(" %(changed)d were changed and %(deleted)d were deleted.") % {
+                "changed": form.cleaned_data["changed"],
+                "deleted": form.cleaned_data["deleted"],
+            }
+
+        messages.success(request, message)
+
+        post_import.send(sender=self.__class__, request=request, form=form)
+
+        return HttpResponseRedirect(
+            reverse(
+                "admin:%s_%s_changelist"
+                % (opts.app_label, opts.model_name),
+            )
+        )
+
+    @method_decorator(require_POST)
+    def import_action(self, request, form, file_format, queryset):
+        """
+        Handles the import process.
+        """
+        if not self.has_import_permission(request):
+            raise PermissionDenied
+
+        if not self.get_skip_admin_log():
+            self.log_action(
+                request,
+                ADDITION,
+                None,
+                _("Imported %(count)d %(items)s."),
+                {"count": form.cleaned_data["total"], "items": self.opts.verbose_name_plural},
+            )
+
+        form.save()
+
+        if not self.get_skip_admin_log():
+            self.log_action(
+                request,
+                CHANGE,
+                None,
+                _("Imported %(count)d %(items)s."),
+                {"count": form.cleaned_data["total"], "items": self.opts.verbose_name_plural},
+            )
+
+        opts = self.model._meta
+        if self.get_skip_admin_log():
+            message = _("Imported %(count)d %(items)s.") % {
+                "count": form.cleaned_data["total"],
+                "items": opts.verbose_name_plural,
+            }
+        else:
+            message = _("Successfully imported %(count)d %(items)s.") % {
+                "count": form.cleaned_data["total"],
+                "items": opts.verbose_name_plural,
+            }
+
+        if form.cleaned_data["update"]:
+            message += _(" %(changed)d were changed and %(deleted)d were deleted.") % {
+                "changed": form.cleaned_data["changed"],
+                "deleted": form.cleaned_data["deleted"],
+            }
+
+        messages.success(request, message)
+
+        post_import.send(sender=self.__class__, request=request, form=form)
+
+        return HttpResponseRedirect(
+            reverse(
+                "admin:%s_%s_changelist"
+                % (opts.app_label, opts.model_name),
+            )
+        )
+
+    @method_decorator(require_POST)
+    def import_action(self, request, form, file_format, queryset):
+        """
+        Handles the import process.
+        """
+        if not self.has_import_permission(request):
+            raise PermissionDenied
+
+        if not self.get_skip_admin_log():
+            self.log_action(
+                request,
+                ADDITION,
+                None,
+                _("Imported %(count)d %(items)s."),
+                {"count": form.cleaned_data["total"], "items": self.opts.verbose_name_plural},
+            )
+
+        form.save()
+
+        if not self.get_skip_admin_log():
+            self.log_action(
+                request,
+                CHANGE,
+                None,
+                _("Imported %(count)d %(items)s."),
+                {"count": form.cleaned_data["total"], "items": self.opts.verbose_name_plural},
+            )
+
+        opts = self.model._meta
+        if self.get_skip_admin_log():
+            message = _("Imported %(count)d %(items)s.") % {
+                "count": form.cleaned_data["total"],
+                "items": opts.verbose_name_plural,
+            }
+        else:
+            message = _("Successfully imported %(count)d %(items)s.") % {
+                "count": form.cleaned_data["total"],
+                "items": opts.verbose_name_plural,
+            }
+
+        if form.cleaned_data["update"]:
+            message += _(" %(changed)d were changed and %(deleted)d were deleted.") % {
+                "changed": form.cleaned_data["changed"],
+                "deleted": form.cleaned_data["deleted"],
+            }
+
+        messages.success(request, message)
+
+        post_import.send(sender=self.__class__, request=request, form=form)
+
+        return HttpResponseRedirect(
+            reverse(
+                "admin:%s_%s_changelist"
+                % (opts.app_label, opts.model_name),
+            )
+        )
+
+    @method_decorator(require_POST)
+    def import_action(self, request, form, file_format, queryset):
+        """
+        Handles the import process.
+        """
+        if not self.has_import_permission(request):
+            raise PermissionDenied
+
+        if not self.get_skip_admin_log():
+            self.log_action(
+                request,
+                ADDITION,
+                None,
+                _("Imported %(count)d %(items)s."),
+                {"count": form.cleaned_data["total"], "items": self.opts.verbose_name_plural},
+            )
+
+        form.save()
+
+        if not self.get_skip_admin_log():
+            self.log_action(
+                request,
+                CHANGE,
+                None,
+                _("Imported %(count)d %(items)s."),
+                {"count": form.cleaned_data["total"], "items": self.opts.verbose_name_plural},
+            )
+
+        opts = self.model._meta
+        if self.get_skip_admin_log():
+            message = _("Imported %(count)d %(items)s.") % {
+                "count": form.cleaned_data["total"],
+                "items": opts.verbose_name_plural,
+            }
+        else:
+            message = _("Successfully imported %(count)d %(items)s.") % {
+                "count": form.cleaned_data["total"],
+                "items": opts.verbose_name_plural,
+            }
+
+        if form.cleaned_data["update"]:
+            message += _(" %(changed)d were changed and %(deleted)d were deleted.") % {
+                "changed": form.cleaned_data["changed"],
+                "deleted": form.cleaned_data["deleted"],
+            }
+
+        messages.success(request, message)
+
+        post_import.send(sender=self.__class__, request=request, form=form)
+
+        return HttpResponseRedirect(
+            reverse(
+                "admin:%s_%s_changelist"
+                % (opts.app_label, opts.model_name),
+            )
+        )
+
+    @method_decorator(require_POST)
+    def import_action(self, request, form, file_format, queryset):
+        """
+        Handles the import process.
+        """
+        if not self.has_import_permission(request):
+            raise PermissionDenied
+
+        if not self.get_skip_admin_log():
+            self.log_action(
+                request,
+                ADDITION,
+                None,
+                _("Imported %(count)d %(items)s."),
+                {"count": form.cleaned_data["total"], "items": self.opts.verbose_name_plural},
+            )
+
+        form.save()
+
+        if not self.get_skip_admin_log():
+            self.log_action(
+                request,
+                CHANGE,
+                None,
+                _("Imported %(count)d %(items)s."),
+                {"count": form.cleaned_data["total"], "items": self.opts.verbose_name_plural},
+            )
+
+        opts = self.model._meta
+        if self.get_skip_admin_log():
+            message = _("Imported %(count)d %(items)s.") % {
+                "count": form.cleaned_data["total"],
+                "items": opts.verbose_name_plural,
+            }
+        else:
+            message = _("Successfully imported %(count)d %(items)s.") % {
+                "count": form.cleaned_data["total"],
+                "items": opts.verbose_name_plural,
+            }
+
+        if form.cleaned_data["update"]:
+            message += _(" %(changed)d were changed and %(deleted)d were deleted.") % {
+                "changed": form.cleaned_data["changed"],
+                "deleted": form.cleaned_data["deleted"],
+            }
+
+        messages.success(request, message)
+
+        post_import.send(sender=self.__class__, request=request, form=form)
+
+        return HttpResponseRedirect(
+            reverse(
+                "admin:%s_%s_changelist"
+                % (opts.app_label, opts.model_name),
+            )
+        )
+
+    @method_decorator(require_POST)
+    def import_action(self, request, form, file_format, queryset):
+        """
+        Handles the import process.
+        """
+        if not self.has_import_permission(request):
+            raise PermissionDenied
+
+        if not self.get_skip_admin_log():
+            self.log_action(
+                request,
+                ADDITION,
+                None,
+                _("Imported %(count)d %(items)s."),
+                {"count": form.cleaned_data["total"], "items": self.opts.verbose_name_plural
